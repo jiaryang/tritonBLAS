@@ -504,6 +504,7 @@ def matmul_a8w8(
     enable_streamk=False,
     work_stealing=False,
     sk_grid=None,
+    debug=False,
 ):
     assert a.shape[1] == b.shape[0], "Incompatible Dimensions"
     M, K = a.shape
