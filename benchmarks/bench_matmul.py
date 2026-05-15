@@ -341,10 +341,22 @@ def bench_matmul(
         # ------------------------------------------------------------
         ms_triton, perf_triton = None, None
         if enable_triton_sk:
-            selector = tritonblas.MatmulHeuristicResult(m, n, k, A.dtype, B.dtype, C.dtype)
-            config = selector.get_config()
-            matmul_triton = lambda: tritonblas.matmul(A, B, C, enable_streamk=enable_streamk)
-            ms_triton = triton.testing.do_bench(matmul_triton, warmup=20, rep=20)
+            selector = tritonblas.OrigamiMatmulSelector(
+                m, n, k, A.dtype, B.dtype, C.dtype, A.device, streamk=enable_streamk
+            )
+            cfg = tritonblas.matmul_preamble(selector)
+
+            def matmul_triton():
+                tritonblas.matmul_lt(
+                    A, B, C, selector, cfg, enable_streamk=enable_streamk
+                )
+
+            def reset_triton():
+                cfg.reset(streamk=enable_streamk, work_stealing=False)
+
+            ms_triton = tritonblas.do_bench(
+                matmul_triton, reset_fn=reset_triton, n_warmup=20, n_repeat=20
+            )
             perf_triton = tflops(ms_triton)
 
         # ------------------------------------------------------------
@@ -398,7 +410,15 @@ def bench_matmul(
             # Check TritonBLAS
             if enable_triton_sk:
                 C_triton = torch.zeros((m, n), device="cuda", dtype=out_dtype)
-                triton_result = tritonblas.matmul(A, B, C_triton, enable_streamk=enable_streamk)
+                selector = tritonblas.OrigamiMatmulSelector(
+                    m, n, k, A.dtype, B.dtype, C_triton.dtype, A.device,
+                    streamk=enable_streamk
+                )
+                cfg = tritonblas.matmul_preamble(selector)
+                tritonblas.matmul_lt(
+                    A, B, C_triton, selector, cfg, enable_streamk=enable_streamk
+                )
+                triton_result = C_triton
                 accuracy_triton, max_abs_error_triton, max_rel_error_triton = check_accuracy(
                     reference_result, triton_result, "TritonBLAS", accuracy_tolerance, accuracy_tolerance
                 )
@@ -586,4 +606,3 @@ if __name__ == "__main__":
 
     if args.output_csv:
         write_csv(args.output_csv, results)
-
