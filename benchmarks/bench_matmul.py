@@ -340,6 +340,12 @@ def format_accuracy(status):
     return f", {'✅' if status else '❌'}acc"
 
 
+def format_selected_streamk(status):
+    if status is None:
+        return ""
+    return f", streamk={'yes' if status else 'no'}"
+
+
 def print_benchmark_summary(results):
     grouped_rows = OrderedDict()
     for row in results:
@@ -362,6 +368,7 @@ def print_benchmark_summary(results):
                     f"  torch.compile[{mode}]: {row['torch_compile_tflops']:.3f} TF/s "
                     f"({row['ms_compile']:.2f} ms, "
                     f"{format_vs_torch(row.get('speedup_compile_vs_torch'))}"
+                    f"{format_selected_streamk(row.get('torch_compile_selected_streamk'))}"
                     f"{format_accuracy(row.get('accuracy_compile'))})"
                 )
 
@@ -387,6 +394,9 @@ def resolve_csv_path(output_csv):
 
 def csv_mode_name(mode):
     return str(mode).replace(".", "_").replace("-", "_")
+
+
+REPORT_STREAMK_SELECTION_MODES = {"streamk", "streamk_tuning"}
 
 
 def merged_benchmark_rows(results, include_error_details=False):
@@ -423,6 +433,8 @@ def merged_benchmark_rows(results, include_error_details=False):
             f"speedup_torch_compile_{mode_name}_vs_torch",
             f"accuracy_torch_compile_{mode_name}",
         ])
+        if mode in REPORT_STREAMK_SELECTION_MODES:
+            fieldnames.append(f"torch_compile_{mode_name}_selected_streamk")
         if include_error_details:
             fieldnames.extend([
                 f"max_abs_error_torch_compile_{mode_name}",
@@ -465,6 +477,10 @@ def merged_benchmark_rows(results, include_error_details=False):
                 merged[f"ms_torch_compile_{mode_name}"] = row.get("ms_compile")
                 merged[f"speedup_torch_compile_{mode_name}_vs_torch"] = speedup
                 merged[f"accuracy_torch_compile_{mode_name}"] = row.get("accuracy_compile")
+                if (row.get("torch_compile_mode") or "default") in REPORT_STREAMK_SELECTION_MODES:
+                    merged[f"torch_compile_{mode_name}_selected_streamk"] = row.get(
+                        "torch_compile_selected_streamk"
+                    )
                 if include_error_details:
                     merged[f"max_abs_error_torch_compile_{mode_name}"] = row.get("max_abs_error_compile")
                     merged[f"max_rel_error_torch_compile_{mode_name}"] = row.get("max_rel_error_compile")
@@ -572,10 +588,17 @@ def bench_matmul(
             # ------------------------------------------------------------
             ms_compile, perf_compile = None, None
             compiled_fn = None
+            torch_compile_selected_streamk = None
+            torch_compile_best_kernel = None
             if torch_compile:
+                os.environ.pop("TORCHINDUCTOR_LAST_AUTOTUNE_BEST_KERNEL", None)
+                os.environ.pop("TORCHINDUCTOR_LAST_AUTOTUNE_EVENT", None)
                 compiled_fn = torch.compile(torch.matmul, dynamic=dynamic)
                 ms_compile = triton.testing.do_bench(lambda: compiled_fn(A, B), warmup=20, rep=100)
                 perf_compile = tflops(ms_compile)
+                torch_compile_best_kernel = os.environ.get("TORCHINDUCTOR_LAST_AUTOTUNE_BEST_KERNEL")
+                if torch_compile_best_kernel:
+                    torch_compile_selected_streamk = "streamk" in torch_compile_best_kernel
 
             # ------------------------------------------------------------
             # 3️⃣ TritonBLAS
@@ -724,7 +747,8 @@ def bench_matmul(
                     msg += f" -> {perf_torch:.3f} TF/s ({ms_torch:.2f} ms)"
                 elif perf_compile:
                     acc_str = format_accuracy(accuracy_compile) if enable_accuracy_check else ""
-                    msg += f" -> {perf_compile:.3f} TF/s ({ms_compile:.2f} ms{acc_str})"
+                    streamk_str = format_selected_streamk(torch_compile_selected_streamk)
+                    msg += f" -> {perf_compile:.3f} TF/s ({ms_compile:.2f} ms{streamk_str}{acc_str})"
                 elif perf_triton:
                     acc_str = format_accuracy(accuracy_triton) if enable_accuracy_check else ""
                     msg += f" -> {perf_triton:.3f} TF/s ({ms_triton:.2f} ms{acc_str})"
@@ -753,6 +777,8 @@ def bench_matmul(
                 "enable_streamk": enable_streamk,
                 "work_stealing": work_stealing,
                 "torch_compile_dynamic": dynamic,
+                "torch_compile_selected_streamk": torch_compile_selected_streamk,
+                "torch_compile_best_kernel": torch_compile_best_kernel,
                 "accuracy_compile": accuracy_compile,
                 "accuracy_triton": accuracy_triton,
                 "max_abs_error_compile": max_abs_error_compile,
@@ -775,9 +801,51 @@ def bench_matmul(
     return benchmark_results
 
 
+TORCH_COMPILE_STREAMK_ENV_KEYS = (
+    "TORCHINDUCTOR_ENABLE_STREAMK",
+    "TORCHINDUCTOR_STREAMK_AUTOTUNE",
+    "TORCHINDUCTOR_STREAMK_ONLY",
+)
+
+
+def torch_compile_env(**enabled_flags):
+    env = {name: None for name in TORCH_COMPILE_STREAMK_ENV_KEYS}
+    env.update(enabled_flags)
+    return env
+
+
 TORCH_COMPILE_MODE_CONFIGS = OrderedDict(
     [
-        ("default", {}),
+        ("default", {"env": torch_compile_env()}),
+        ("streamk", {"env": torch_compile_env(TORCHINDUCTOR_ENABLE_STREAMK=1)}),
+        (
+            "streamk_tuning",
+            {
+                "env": torch_compile_env(
+                    TORCHINDUCTOR_ENABLE_STREAMK=1,
+                    TORCHINDUCTOR_STREAMK_AUTOTUNE=1,
+                )
+            },
+        ),
+        (
+            "force_streamk",
+            {
+                "env": torch_compile_env(
+                    TORCHINDUCTOR_ENABLE_STREAMK=1,
+                    TORCHINDUCTOR_STREAMK_ONLY=1,
+                )
+            },
+        ),
+        (
+            "force_streamk_tuning",
+            {
+                "env": torch_compile_env(
+                    TORCHINDUCTOR_ENABLE_STREAMK=1,
+                    TORCHINDUCTOR_STREAMK_ONLY=1,
+                    TORCHINDUCTOR_STREAMK_AUTOTUNE=1,
+                )
+            },
+        ),
     ]
 )
 
@@ -786,7 +854,10 @@ def apply_env_overrides(env_overrides):
     previous_values = {}
     for name, value in env_overrides.items():
         previous_values[name] = os.environ.get(name)
-        os.environ[name] = str(value)
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = str(value)
     return previous_values
 
 
@@ -870,9 +941,17 @@ if __name__ == "__main__":
                         help="TritonBLAS modes to benchmark. Use 'all' to run persistent, streamk, "
                              "work_stealing, and streamk_work_stealing.")
     parser.add_argument("--torch-compile-modes", nargs="+",
-                        choices=["default", "all"],
+                        choices=[
+                            "default",
+                            "streamk",
+                            "streamk_tuning",
+                            "force_streamk",
+                            "force_streamk_tuning",
+                            "all",
+                        ],
                         help="torch.compile modes to benchmark. Use 'all' to run every configured "
-                             "torch.compile mode. New env-flag modes should be added here.")
+                             "torch.compile mode: default, streamk, streamk_tuning, "
+                             "force_streamk, and force_streamk_tuning.")
     parser.add_argument("--dynamic", action="store_true")
     parser.add_argument("--check-accuracy", action="store_true",
                         help="Check numerical accuracy against torch.matmul reference")
