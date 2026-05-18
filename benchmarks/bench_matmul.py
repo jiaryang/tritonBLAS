@@ -4,7 +4,6 @@ TritonBLAS Matrix Multiplication Benchmark with Accuracy Validation
 
 This benchmark compares different matrix multiplication implementations:
 - torch.matmul (baseline reference)
-- torch.mm with environment override
 - torch.compile (Inductor Triton kernels)
 - TritonBLAS (Stream-K implementation)
 
@@ -24,28 +23,26 @@ Usage Examples:
 
   # Compare all implementations with accuracy
   python bench_matmul.py --input-yaml config.yaml --check-accuracy \\
-    --enable-triton-sk --enable-streamk --torch-compile --enable-mm-env \\
+    --torch-compile-modes all --tritonblas-modes all \\
     --output-csv results.csv --print-verbose
 
   # Custom accuracy tolerance for fp16
   python bench_matmul.py --input-yaml config.yaml --check-accuracy \\
-    --accuracy-tolerance 1e-2 --enable-triton-sk
+    --accuracy-tolerance 1e-2 --tritonblas-modes streamk
 
   # Disable torch.matmul baseline (useful for torch-free environments)
   python bench_matmul.py --input-yaml config.yaml --disable-torch-matmul \\
-    --enable-triton-sk --print-verbose
+    --tritonblas-modes persistent --print-verbose
 """
 
 import argparse
 import csv
-import math
+import gc
 import os
 import random
-import zipfile
+import shutil
 from collections import OrderedDict
-from datetime import datetime, timezone
 from pathlib import Path
-from xml.sax.saxutils import escape
 
 import triton
 import tritonblas
@@ -66,6 +63,48 @@ def setup_torch_compile_config():
     torch._inductor.config.freezing = True
     torch._inductor.config.max_autotune = True
     torch._dynamo.config.recompile_limit = 256
+
+
+def clear_torch_compile_cache(print_verbose=False):
+    """Clear torch.compile in-memory and on-disk caches before a benchmark pass."""
+    try:
+        import torch._dynamo
+        torch._dynamo.reset()
+    except Exception as exc:
+        if print_verbose:
+            print(f"WARNING: torch._dynamo.reset() failed: {exc}")
+
+    try:
+        from torch._inductor.utils import clear_inductor_caches
+        clear_inductor_caches()
+    except Exception as exc:
+        if print_verbose:
+            print(f"WARNING: torch._inductor cache reset failed: {exc}")
+
+    cache_paths = []
+    try:
+        from torch._inductor.runtime.cache_dir_utils import cache_dir, triton_cache_dir
+        cache_paths.append(Path(cache_dir()))
+        if torch.cuda.is_available():
+            cache_paths.append(Path(triton_cache_dir(torch.cuda.current_device())))
+    except Exception as exc:
+        if print_verbose:
+            print(f"WARNING: could not resolve torch.compile cache dirs: {exc}")
+
+    for env_name in ("TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR"):
+        env_path = os.environ.get(env_name)
+        if env_path:
+            cache_paths.append(Path(env_path))
+
+    seen = set()
+    for path in sorted(cache_paths, key=lambda p: len(p.parts), reverse=True):
+        if path in seen:
+            continue
+        seen.add(path)
+        if path.exists():
+            if print_verbose:
+                print(f"Clearing torch.compile cache: {path}")
+            shutil.rmtree(path, ignore_errors=True)
 
 
 class BenchmarkRunError(RuntimeError):
@@ -257,22 +296,7 @@ def check_accuracy(reference_result, test_result, impl_name, tolerance=None, rel
     return is_accurate, max_abs_error, max_rel_error
 
 
-def benchmark_fieldnames():
-    return [
-        "m", "n", "k", "transA", "transB", "in_dtype", "out_dtype",
-        "flops",
-        "torch_tflops", "torch_mm_env_tflops", "torch_compile_tflops", "tritonblas_tflops",
-        "speedup_mm_env_vs_torch", "speedup_compile_vs_torch", "speedup_triton_vs_torch",
-        "ms_torch", "ms_mm_env", "ms_compile", "ms_triton",
-        "enable_streamk", "torch_compile_dynamic",
-        "accuracy_mm_env", "accuracy_compile", "accuracy_triton",
-        "max_abs_error_mm_env", "max_abs_error_compile", "max_abs_error_triton",
-        "max_rel_error_mm_env", "max_rel_error_compile", "max_rel_error_triton",
-        "accuracy_tolerance",
-    ]
-
-
-def benchmark_case_key(row):
+def benchmark_shape_key(row):
     return (
         row.get("m"),
         row.get("n"),
@@ -281,222 +305,195 @@ def benchmark_case_key(row):
         row.get("transB"),
         row.get("in_dtype"),
         row.get("out_dtype"),
-        row.get("enable_streamk"),
-        row.get("torch_compile_dynamic"),
     )
 
 
-def average_iteration_results(iteration_results):
-    aggregated = OrderedDict()
-    for iteration_rows in iteration_results:
-        for row in iteration_rows:
-            key = benchmark_case_key(row)
-            aggregated.setdefault(key, []).append(row)
+def fill_speedups_vs_torch(results):
+    torch_by_shape = {
+        benchmark_shape_key(row): row.get("torch_tflops")
+        for row in results
+        if row.get("torch_tflops")
+    }
 
-    averaged_results = []
-    fieldnames = benchmark_fieldnames()
-    for rows in aggregated.values():
-        averaged_row = {}
-        for field in fieldnames:
-            values = [row.get(field) for row in rows if row.get(field) is not None]
-            if not values:
-                averaged_row[field] = None
-                continue
-            if all(isinstance(v, bool) for v in values):
-                averaged_row[field] = all(values)
-                continue
-            if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in values):
-                finite_values = [v for v in values if not isinstance(v, float) or math.isfinite(v)]
-                if finite_values:
-                    averaged_row[field] = sum(finite_values) / len(finite_values)
-                else:
-                    averaged_row[field] = None
-                continue
-            averaged_row[field] = values[0]
-        averaged_results.append(averaged_row)
-    return averaged_results
+    for row in results:
+        torch_tflops = torch_by_shape.get(benchmark_shape_key(row))
+        if not torch_tflops:
+            continue
+        compile_tflops = row.get("torch_compile_tflops")
+        triton_tflops = row.get("tritonblas_tflops")
+        if compile_tflops:
+            row["speedup_compile_vs_torch"] = compile_tflops / torch_tflops
+        if triton_tflops:
+            row["speedup_triton_vs_torch"] = triton_tflops / torch_tflops
 
 
-def resolve_report_path(output_report):
-    if output_report:
-        path = Path(output_report)
-        if path.suffix.lower() != ".xlsx":
-            path = path.with_suffix(".xlsx")
-        return path
-    return Path("benchmark_results.xlsx")
+def format_vs_torch(speedup):
+    if speedup is None:
+        return "N/A vs torch"
+    percent = (speedup - 1.0) * 100.0
+    return f"{speedup:.2f}x, {percent:+.1f}% vs torch"
 
 
-def _excel_column_name(index):
-    name = []
-    while index > 0:
-        index, remainder = divmod(index - 1, 26)
-        name.append(chr(ord("A") + remainder))
-    return "".join(reversed(name))
-
-
-def _worksheet_cell_xml(cell_ref, value):
-    if value is None:
+def format_accuracy(status):
+    if status is None:
         return ""
-    if isinstance(value, bool):
-        return f'<c r="{cell_ref}" t="b"><v>{1 if value else 0}</v></c>'
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        if isinstance(value, float) and not math.isfinite(value):
-            value = str(value)
-        else:
-            return f'<c r="{cell_ref}"><v>{value}</v></c>'
-    text = escape(str(value))
-    return f'<c r="{cell_ref}" t="inlineStr"><is><t>{text}</t></is></c>'
+    return f", {'✅' if status else '❌'}acc"
 
 
-def _worksheet_xml(headers, rows):
-    row_xml = []
+def print_benchmark_summary(results):
+    grouped_rows = OrderedDict()
+    for row in results:
+        grouped_rows.setdefault(benchmark_shape_key(row), []).append(row)
 
-    def build_row_xml(row_idx, values):
-        cells = []
-        for col_idx, value in enumerate(values, start=1):
-            cell_ref = f"{_excel_column_name(col_idx)}{row_idx}"
-            cell_xml = _worksheet_cell_xml(cell_ref, value)
-            if cell_xml:
-                cells.append(cell_xml)
-        return f'<row r="{row_idx}">{"".join(cells)}</row>'
+    for case_idx, ((m, n, k, transA, transB, in_dtype, _), rows) in enumerate(grouped_rows.items(), start=1):
+        print(f"\nTest {case_idx}: [M={m},N={n},K={k},trans={transA}{transB}] dtype={in_dtype}")
 
-    row_xml.append(build_row_xml(1, headers))
-    for row_idx, row in enumerate(rows, start=2):
-        row_xml.append(build_row_xml(row_idx, [row.get(header) for header in headers]))
+        for row in rows:
+            if row.get("torch_tflops"):
+                print(
+                    f"  torch.matmul: {row['torch_tflops']:.3f} TF/s "
+                    f"({row['ms_torch']:.2f} ms, 100.0%)"
+                )
 
-    last_col = _excel_column_name(len(headers))
-    last_row = max(1, len(rows) + 1)
-    return f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
-  <dimension ref="A1:{last_col}{last_row}"/>
-  <sheetViews><sheetView workbookViewId="0"/></sheetViews>
-  <sheetFormatPr defaultRowHeight="15"/>
-  <sheetData>{''.join(row_xml)}</sheetData>
-</worksheet>
-"""
+        for row in rows:
+            if row.get("torch_compile_tflops"):
+                mode = row.get("torch_compile_mode") or "default"
+                print(
+                    f"  torch.compile[{mode}]: {row['torch_compile_tflops']:.3f} TF/s "
+                    f"({row['ms_compile']:.2f} ms, "
+                    f"{format_vs_torch(row.get('speedup_compile_vs_torch'))}"
+                    f"{format_accuracy(row.get('accuracy_compile'))})"
+                )
+
+        for row in rows:
+            if row.get("tritonblas_tflops"):
+                mode = row.get("tritonblas_mode") or "tritonblas"
+                print(
+                    f"  TritonBLAS[{mode}]: {row['tritonblas_tflops']:.3f} TF/s "
+                    f"({row['ms_triton']:.2f} ms, "
+                    f"{format_vs_torch(row.get('speedup_triton_vs_torch'))}"
+                    f"{format_accuracy(row.get('accuracy_triton'))})"
+                )
 
 
-def write_xlsx(filename, average_results, iteration_results):
-    headers = benchmark_fieldnames()
-    sheets = [("Average", average_results)]
-    for idx, rows in enumerate(iteration_results, start=1):
-        sheets.append((f"Iteration {idx}", rows))
+def resolve_csv_path(output_csv):
+    if output_csv:
+        path = Path(output_csv)
+        if path.suffix.lower() != ".csv":
+            path = path.with_suffix(".csv")
+        return path
+    return Path("benchmark_results.csv")
 
-    filename = Path(filename)
-    filename.parent.mkdir(parents=True, exist_ok=True)
 
-    workbook_xml = [
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
-        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
-        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">',
-        "  <sheets>",
+def csv_mode_name(mode):
+    return str(mode).replace(".", "_").replace("-", "_")
+
+
+def merged_benchmark_rows(results, include_error_details=False):
+    grouped_rows = OrderedDict()
+    compile_modes = []
+    tritonblas_modes = []
+    seen_compile_modes = set()
+    seen_tritonblas_modes = set()
+
+    for row in results:
+        grouped_rows.setdefault(benchmark_shape_key(row), []).append(row)
+
+        compile_mode = row.get("torch_compile_mode")
+        if row.get("torch_compile_tflops") is not None and compile_mode not in seen_compile_modes:
+            compile_modes.append(compile_mode or "default")
+            seen_compile_modes.add(compile_mode)
+
+        tritonblas_mode = row.get("tritonblas_mode")
+        if row.get("tritonblas_tflops") is not None and tritonblas_mode not in seen_tritonblas_modes:
+            tritonblas_modes.append(tritonblas_mode or "tritonblas")
+            seen_tritonblas_modes.add(tritonblas_mode)
+
+    fieldnames = [
+        "m", "n", "k", "transA", "transB", "in_dtype", "out_dtype", "flops",
+        "",
+        "torch_tflops", "ms_torch",
     ]
-    workbook_rels = [
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
-        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">',
-    ]
-    content_types = [
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
-        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">',
-        '  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>',
-        '  <Default Extension="xml" ContentType="application/xml"/>',
-        '  <Override PartName="/xl/workbook.xml" '
-        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>',
-        '  <Override PartName="/xl/styles.xml" '
-        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>',
-        '  <Override PartName="/docProps/core.xml" '
-        'ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>',
-        '  <Override PartName="/docProps/app.xml" '
-        'ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>',
-    ]
+    for mode in compile_modes:
+        mode_name = csv_mode_name(mode)
+        fieldnames.extend([
+            "",
+            f"torch_compile_{mode_name}_tflops",
+            f"ms_torch_compile_{mode_name}",
+            f"speedup_torch_compile_{mode_name}_vs_torch",
+            f"accuracy_torch_compile_{mode_name}",
+        ])
+        if include_error_details:
+            fieldnames.extend([
+                f"max_abs_error_torch_compile_{mode_name}",
+                f"max_rel_error_torch_compile_{mode_name}",
+            ])
+    for mode in tritonblas_modes:
+        mode_name = csv_mode_name(mode)
+        fieldnames.extend([
+            "",
+            f"tritonblas_{mode_name}_tflops",
+            f"ms_tritonblas_{mode_name}",
+            f"speedup_tritonblas_{mode_name}_vs_torch",
+            f"accuracy_tritonblas_{mode_name}",
+        ])
+        if include_error_details:
+            fieldnames.extend([
+                f"max_abs_error_tritonblas_{mode_name}",
+                f"max_rel_error_tritonblas_{mode_name}",
+            ])
+    merged_rows = []
+    for (m, n, k, transA, transB, in_dtype, out_dtype), rows in grouped_rows.items():
+        merged = {
+            "m": m, "n": n, "k": k,
+            "transA": transA, "transB": transB,
+            "in_dtype": in_dtype, "out_dtype": out_dtype,
+        }
 
-    for idx, (name, rows) in enumerate(sheets, start=1):
-        workbook_xml.append(
-            f'    <sheet name="{escape(name)}" sheetId="{idx}" r:id="rId{idx}"/>'
-        )
-        workbook_rels.append(
-            f'  <Relationship Id="rId{idx}" '
-            f'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
-            f'Target="worksheets/sheet{idx}.xml"/>'
-        )
-        content_types.append(
-            f'  <Override PartName="/xl/worksheets/sheet{idx}.xml" '
-            f'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
-        )
+        for row in rows:
+            if row.get("flops") is not None:
+                merged["flops"] = row.get("flops")
 
-    workbook_xml.extend(["  </sheets>", "</workbook>"])
-    workbook_rels.extend([
-        '  <Relationship Id="rIdStyles" '
-        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" '
-        'Target="styles.xml"/>',
-        "</Relationships>",
-    ])
-    content_types.append("</Types>")
+            if row.get("torch_tflops") is not None:
+                merged["torch_tflops"] = row.get("torch_tflops")
+                merged["ms_torch"] = row.get("ms_torch")
 
-    package_rels = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
-  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/>
-  <Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/>
-</Relationships>
-"""
+            if row.get("torch_compile_tflops") is not None:
+                mode_name = csv_mode_name(row.get("torch_compile_mode") or "default")
+                speedup = row.get("speedup_compile_vs_torch")
+                merged[f"torch_compile_{mode_name}_tflops"] = row.get("torch_compile_tflops")
+                merged[f"ms_torch_compile_{mode_name}"] = row.get("ms_compile")
+                merged[f"speedup_torch_compile_{mode_name}_vs_torch"] = speedup
+                merged[f"accuracy_torch_compile_{mode_name}"] = row.get("accuracy_compile")
+                if include_error_details:
+                    merged[f"max_abs_error_torch_compile_{mode_name}"] = row.get("max_abs_error_compile")
+                    merged[f"max_rel_error_torch_compile_{mode_name}"] = row.get("max_rel_error_compile")
 
-    styles_xml = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
-  <fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts>
-  <fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills>
-  <borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>
-  <cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
-  <cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs>
-  <cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>
-</styleSheet>
-"""
+            if row.get("tritonblas_tflops") is not None:
+                mode_name = csv_mode_name(row.get("tritonblas_mode") or "tritonblas")
+                speedup = row.get("speedup_triton_vs_torch")
+                merged[f"tritonblas_{mode_name}_tflops"] = row.get("tritonblas_tflops")
+                merged[f"ms_tritonblas_{mode_name}"] = row.get("ms_triton")
+                merged[f"speedup_tritonblas_{mode_name}_vs_torch"] = speedup
+                merged[f"accuracy_tritonblas_{mode_name}"] = row.get("accuracy_triton")
+                if include_error_details:
+                    merged[f"max_abs_error_tritonblas_{mode_name}"] = row.get("max_abs_error_triton")
+                    merged[f"max_rel_error_tritonblas_{mode_name}"] = row.get("max_rel_error_triton")
 
-    now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-    core_xml = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties"
- xmlns:dc="http://purl.org/dc/elements/1.1/"
- xmlns:dcterms="http://purl.org/dc/terms/"
- xmlns:dcmitype="http://purl.org/dc/dcmitype/"
- xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
-  <dc:title>TritonBLAS Benchmark Report</dc:title>
-  <dc:creator>Codex</dc:creator>
-  <cp:lastModifiedBy>Codex</cp:lastModifiedBy>
-  <dcterms:created xsi:type="dcterms:W3CDTF">{now}</dcterms:created>
-  <dcterms:modified xsi:type="dcterms:W3CDTF">{now}</dcterms:modified>
-</cp:coreProperties>
-"""
+        merged_rows.append(merged)
 
-    app_xml = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"
- xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes">
-  <Application>Python</Application>
-  <TitlesOfParts>
-    <vt:vector size="{len(sheets)}" baseType="lpstr">
-      {''.join(f'<vt:lpstr>{escape(name)}</vt:lpstr>' for name, _ in sheets)}
-    </vt:vector>
-  </TitlesOfParts>
-</Properties>
-"""
-
-    with zipfile.ZipFile(filename, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("[Content_Types].xml", "\n".join(content_types))
-        zf.writestr("_rels/.rels", package_rels)
-        zf.writestr("xl/workbook.xml", "\n".join(workbook_xml))
-        zf.writestr("xl/_rels/workbook.xml.rels", "\n".join(workbook_rels))
-        zf.writestr("xl/styles.xml", styles_xml)
-        zf.writestr("docProps/core.xml", core_xml)
-        zf.writestr("docProps/app.xml", app_xml)
-        for idx, (_, rows) in enumerate(sheets, start=1):
-            zf.writestr(f"xl/worksheets/sheet{idx}.xml", _worksheet_xml(headers, rows))
-
-    print(f"✅ Excel report saved to '{filename}'")
+    return fieldnames, merged_rows
 
 
-def write_reports(output_report, iteration_results):
-    average_results = average_iteration_results(iteration_results) if iteration_results else []
-    report_path = resolve_report_path(output_report)
-    write_xlsx(report_path, average_results, iteration_results)
+def write_csv(output_csv, results, include_error_details=False):
+    path = resolve_csv_path(output_csv)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames, rows = merged_benchmark_rows(results, include_error_details=include_error_details)
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"✅ CSV report saved to '{path}'")
 
 
 # ============================================================
@@ -508,16 +505,17 @@ def bench_matmul(
     init_type: str,
     print_verbose=False,
     shuffle_benchmark=True,
-    output_csv=None,
-    write_csv_freq=100,
     enable_streamk=False,
     torch_compile=False,
-    enable_triton_sk=False,
+    torch_compile_mode=None,
     dynamic=False,
-    enable_mm_env=False,
+    work_stealing=False,
+    tritonblas_mode=None,
     enable_accuracy_check=False,
     accuracy_tolerance=1e-3,
     enable_torch_matmul=True,
+    print_case_results=True,
+    progress_label=None,
 ):
     with open(input_yaml, "r") as f:
         dataset = yaml.safe_load(f)
@@ -566,38 +564,25 @@ def bench_matmul(
             # ------------------------------------------------------------
             ms_torch, perf_torch = None, None
             if enable_torch_matmul:
-                ms_torch = triton.testing.do_bench(lambda: torch.matmul(A, B), warmup=20, rep=20)
+                ms_torch = triton.testing.do_bench(lambda: torch.matmul(A, B), warmup=20, rep=100)
                 perf_torch = tflops(ms_torch)
 
             # ------------------------------------------------------------
-            # 2️⃣ Torch.mm with env override
-            # ------------------------------------------------------------
-            ms_mm_env, perf_mm_env = None, None
-            if enable_mm_env:
-                old_env = os.environ.get("TENSILE_SOLUTION_SELECTION_METHOD", None)
-                os.environ["TENSILE_SOLUTION_SELECTION_METHOD"] = "2"
-                ms_mm_env = triton.testing.do_bench(lambda: torch.mm(A, B), warmup=20, rep=20)
-                perf_mm_env = tflops(ms_mm_env)
-                # restore env
-                if old_env is not None:
-                    os.environ["TENSILE_SOLUTION_SELECTION_METHOD"] = old_env
-                else:
-                    del os.environ["TENSILE_SOLUTION_SELECTION_METHOD"]
-
-            # ------------------------------------------------------------
-            # 3️⃣ Torch.compile (Inductor Triton kernel)
+            # 2️⃣ Torch.compile (Inductor Triton kernel)
             # ------------------------------------------------------------
             ms_compile, perf_compile = None, None
+            compiled_fn = None
             if torch_compile:
                 compiled_fn = torch.compile(torch.matmul, dynamic=dynamic)
-                ms_compile = triton.testing.do_bench(lambda: compiled_fn(A, B), warmup=20, rep=20)
+                ms_compile = triton.testing.do_bench(lambda: compiled_fn(A, B), warmup=20, rep=100)
                 perf_compile = tflops(ms_compile)
 
             # ------------------------------------------------------------
-            # 4️⃣ TritonBLAS (Stream-K)
+            # 3️⃣ TritonBLAS
             # ------------------------------------------------------------
             ms_triton, perf_triton = None, None
-            if enable_triton_sk:
+            run_tritonblas = tritonblas_mode is not None
+            if run_tritonblas:
                 selector = tritonblas.OrigamiMatmulSelector(
                     m, n, k, A.dtype, B.dtype, C.dtype, A.device, streamk=enable_streamk
                 )
@@ -605,45 +590,34 @@ def bench_matmul(
 
                 def matmul_triton():
                     tritonblas.matmul_lt(
-                        A, B, C, selector, cfg, enable_streamk=enable_streamk
+                        A, B, C, selector, cfg,
+                        enable_streamk=enable_streamk,
+                        work_stealing=work_stealing,
                     )
 
                 def reset_triton():
-                    cfg.reset(streamk=enable_streamk, work_stealing=False)
+                    cfg.reset(streamk=enable_streamk, work_stealing=work_stealing)
 
                 ms_triton = tritonblas.do_bench(
-                    matmul_triton, reset_fn=reset_triton, n_warmup=20, n_repeat=20
+                    matmul_triton, reset_fn=reset_triton, n_warmup=20, n_repeat=100
                 )
                 perf_triton = tflops(ms_triton)
 
             # ------------------------------------------------------------
             # Accuracy Check (if enabled)
             # ------------------------------------------------------------
-            accuracy_mm_env, accuracy_compile, accuracy_triton = None, None, None
-            max_abs_error_mm_env, max_abs_error_compile, max_abs_error_triton = None, None, None
-            max_rel_error_mm_env, max_rel_error_compile, max_rel_error_triton = None, None, None
+            accuracy_compile, accuracy_triton = None, None
+            max_abs_error_compile, max_abs_error_triton = None, None
+            max_rel_error_compile, max_rel_error_triton = None, None
 
-            if enable_accuracy_check and enable_torch_matmul:
+            if enable_accuracy_check and (enable_torch_matmul or torch_compile or run_tritonblas):
                 # Compute reference result (torch.matmul)
                 reference_result = torch.matmul(A, B)
 
-                # Check torch.mm with env override
-                if enable_mm_env:
-                    old_env = os.environ.get("TENSILE_SOLUTION_SELECTION_METHOD", None)
-                    os.environ["TENSILE_SOLUTION_SELECTION_METHOD"] = "2"
-                    mm_env_result = torch.mm(A, B)
-                    accuracy_mm_env, max_abs_error_mm_env, max_rel_error_mm_env = check_accuracy(
-                        reference_result, mm_env_result, "torch.mm(env=2)", accuracy_tolerance, accuracy_tolerance
-                    )
-                    # restore env
-                    if old_env is not None:
-                        os.environ["TENSILE_SOLUTION_SELECTION_METHOD"] = old_env
-                    else:
-                        del os.environ["TENSILE_SOLUTION_SELECTION_METHOD"]
-
                 # Check torch.compile
                 if torch_compile:
-                    compiled_fn = torch.compile(torch.matmul, dynamic=dynamic)
+                    if compiled_fn is None:
+                        compiled_fn = torch.compile(torch.matmul, dynamic=dynamic)
                     compile_result = compiled_fn(A, B)
                     accuracy_compile, max_abs_error_compile, max_rel_error_compile = check_accuracy(
                         reference_result, compile_result, "torch.compile", accuracy_tolerance, accuracy_tolerance
@@ -665,7 +639,7 @@ def bench_matmul(
                         print(f"  Difference: {diff[max_row, max_col].item():.6e}")
 
                 # Check TritonBLAS
-                if enable_triton_sk:
+                if run_tritonblas:
                     C_triton = torch.zeros((m, n), device="cuda", dtype=out_dtype)
                     selector = tritonblas.OrigamiMatmulSelector(
                         m, n, k, A.dtype, B.dtype, C_triton.dtype, A.device,
@@ -673,7 +647,9 @@ def bench_matmul(
                     )
                     cfg = tritonblas.matmul_preamble(selector)
                     tritonblas.matmul_lt(
-                        A, B, C_triton, selector, cfg, enable_streamk=enable_streamk
+                        A, B, C_triton, selector, cfg,
+                        enable_streamk=enable_streamk,
+                        work_stealing=work_stealing,
                     )
                     triton_result = C_triton
                     accuracy_triton, max_abs_error_triton, max_rel_error_triton = check_accuracy(
@@ -698,14 +674,13 @@ def bench_matmul(
             # ------------------------------------------------------------
             # Speedup vs Torch baseline
             # ------------------------------------------------------------
-            speedup_mm_env = perf_mm_env / perf_torch if (perf_mm_env and perf_torch) else None
             speedup_compile = perf_compile / perf_torch if (perf_compile and perf_torch) else None
             speedup_triton = perf_triton / perf_torch if (perf_triton and perf_torch) else None
 
             # ------------------------------------------------------------
             # Logging
             # ------------------------------------------------------------
-            if print_verbose:
+            if print_verbose and print_case_results:
                 test_case_id = count + 1
                 msg = f"Test {test_case_id}: [M={m},N={n},K={k},trans={transA}{transB}] dtype={in_dtype}"
                 if perf_torch:
@@ -713,12 +688,6 @@ def bench_matmul(
                 else:
                     msg += " | Torch=DISABLED"
                 msg += " "
-                if perf_mm_env:
-                    acc_str = ""
-                    if enable_accuracy_check and accuracy_mm_env is not None:
-                        acc_str = f", {'✅' if accuracy_mm_env else '❌'}acc"
-                    speedup_str = f"{speedup_mm_env:.2f}x" if speedup_mm_env is not None else "N/A"
-                    msg += f"| mm(env=2)={perf_mm_env:.3f} ({ms_mm_env:.2f} ms, {speedup_str}{acc_str}) "
                 if perf_compile:
                     acc_str = ""
                     if enable_accuracy_check and accuracy_compile is not None:
@@ -730,14 +699,12 @@ def bench_matmul(
                     if enable_accuracy_check and accuracy_triton is not None:
                         acc_str = f", {'✅' if accuracy_triton else '❌'}acc"
                     speedup_str = f"{speedup_triton:.2f}x" if speedup_triton is not None else "N/A"
-                    msg += f"| Triton={perf_triton:.3f} ({ms_triton:.2f} ms, {speedup_str}{acc_str})"
+                    mode_label = tritonblas_mode or "tritonblas"
+                    msg += f"| Triton[{mode_label}]={perf_triton:.3f} ({ms_triton:.2f} ms, {speedup_str}{acc_str})"
                 print(msg)
 
-                if enable_accuracy_check and any([accuracy_mm_env is not None, accuracy_compile is not None, accuracy_triton is not None]):
+                if enable_accuracy_check and any([accuracy_compile is not None, accuracy_triton is not None]):
                     acc_details = "    Accuracy Details: "
-                    if accuracy_mm_env is not None:
-                        status = "✅" if accuracy_mm_env else "❌"
-                        acc_details += f"mm(env=2): {status} (abs_err={max_abs_error_mm_env:.2e}, rel_err={max_rel_error_mm_env:.2e}) "
                     if accuracy_compile is not None:
                         status = "✅" if accuracy_compile else "❌"
                         acc_details += f"compile: {status} (abs_err={max_abs_error_compile:.2e}, rel_err={max_rel_error_compile:.2e}) "
@@ -745,6 +712,25 @@ def bench_matmul(
                         status = "✅" if accuracy_triton else "❌"
                         acc_details += f"Triton: {status} (abs_err={max_abs_error_triton:.2e}, rel_err={max_rel_error_triton:.2e}) "
                     print(acc_details)
+
+            if print_verbose and not print_case_results:
+                case_id = count + 1
+                label = progress_label or "benchmark"
+                msg = (
+                    f"  [{case_id}/{len(dataset_tuples)}] {label}: "
+                    f"[M={m},N={n},K={k},trans={transA}{transB}] dtype={in_dtype}"
+                )
+                if perf_torch:
+                    msg += f" -> {perf_torch:.3f} TF/s ({ms_torch:.2f} ms)"
+                elif perf_compile:
+                    acc_str = format_accuracy(accuracy_compile) if enable_accuracy_check else ""
+                    msg += f" -> {perf_compile:.3f} TF/s ({ms_compile:.2f} ms{acc_str})"
+                elif perf_triton:
+                    acc_str = format_accuracy(accuracy_triton) if enable_accuracy_check else ""
+                    msg += f" -> {perf_triton:.3f} TF/s ({ms_triton:.2f} ms{acc_str})"
+                else:
+                    msg += " -> completed"
+                print(msg, flush=True)
 
             # ------------------------------------------------------------
             # Record
@@ -755,25 +741,22 @@ def bench_matmul(
                 "transA": transA, "transB": transB,
                 "flops": flops,
                 "torch_tflops": perf_torch,
-                "torch_mm_env_tflops": perf_mm_env,
                 "torch_compile_tflops": perf_compile,
                 "tritonblas_tflops": perf_triton,
-                "speedup_mm_env_vs_torch": speedup_mm_env,
                 "speedup_compile_vs_torch": speedup_compile,
                 "speedup_triton_vs_torch": speedup_triton,
                 "ms_torch": ms_torch,
-                "ms_mm_env": ms_mm_env,
                 "ms_compile": ms_compile,
                 "ms_triton": ms_triton,
+                "torch_compile_mode": torch_compile_mode if torch_compile else None,
+                "tritonblas_mode": tritonblas_mode,
                 "enable_streamk": enable_streamk,
+                "work_stealing": work_stealing,
                 "torch_compile_dynamic": dynamic,
-                "accuracy_mm_env": accuracy_mm_env,
                 "accuracy_compile": accuracy_compile,
                 "accuracy_triton": accuracy_triton,
-                "max_abs_error_mm_env": max_abs_error_mm_env,
                 "max_abs_error_compile": max_abs_error_compile,
                 "max_abs_error_triton": max_abs_error_triton,
-                "max_rel_error_mm_env": max_rel_error_mm_env,
                 "max_rel_error_compile": max_rel_error_compile,
                 "max_rel_error_triton": max_rel_error_triton,
                 "accuracy_tolerance": accuracy_tolerance if enable_accuracy_check else None,
@@ -786,18 +769,83 @@ def bench_matmul(
             benchmark_results,
             exc,
         ) from exc
+    finally:
+        gc.collect()
 
     return benchmark_results
 
 
-def write_csv(filename: str, results):
-    fieldnames = benchmark_fieldnames()
-    with open(filename, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for r in results:
-            writer.writerow(r)
-    print(f"✅ Results saved to '{filename}'")
+TORCH_COMPILE_MODE_CONFIGS = OrderedDict(
+    [
+        ("default", {}),
+    ]
+)
+
+
+def apply_env_overrides(env_overrides):
+    previous_values = {}
+    for name, value in env_overrides.items():
+        previous_values[name] = os.environ.get(name)
+        os.environ[name] = str(value)
+    return previous_values
+
+
+def restore_env_overrides(previous_values):
+    for name, previous_value in previous_values.items():
+        if previous_value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = previous_value
+
+
+def resolve_torch_compile_modes(args):
+    if not args.torch_compile_modes:
+        return []
+
+    requested_modes = []
+    for mode in args.torch_compile_modes:
+        if mode == "all":
+            requested_modes.extend(TORCH_COMPILE_MODE_CONFIGS.keys())
+        else:
+            requested_modes.append(mode)
+
+    modes = []
+    seen = set()
+    for mode in requested_modes:
+        if mode not in seen:
+            modes.append(mode)
+            seen.add(mode)
+    return modes
+
+
+TRITONBLAS_MODE_CONFIGS = OrderedDict(
+    [
+        ("persistent", (False, False)),
+        ("streamk", (True, False)),
+        ("work_stealing", (False, True)),
+        ("streamk_work_stealing", (True, True)),
+    ]
+)
+
+
+def resolve_tritonblas_modes(args):
+    if not args.tritonblas_modes:
+        return []
+
+    requested_modes = []
+    for mode in args.tritonblas_modes:
+        if mode == "all":
+            requested_modes.extend(TRITONBLAS_MODE_CONFIGS.keys())
+        else:
+            requested_modes.append(mode)
+
+    modes = []
+    seen = set()
+    for mode in requested_modes:
+        if mode not in seen:
+            modes.append(mode)
+            seen.add(mode)
+    return modes
 
 
 # ============================================================
@@ -806,77 +854,137 @@ def write_csv(filename: str, results):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Compare Torch, Torch(mm env=2), Torch.compile, TritonBLAS performance and accuracy (TFLOPS, ms, errors vs torch.matmul baseline)."
+        description="Compare Torch, Torch.compile, TritonBLAS performance and accuracy (TFLOPS, ms, errors vs torch.matmul baseline)."
     )
     parser.add_argument("--input-yaml", type=str, required=True)
-    parser.add_argument("--output-report", type=str, default="",
-                        help="Preferred report output path. The script writes an .xlsx workbook "
-                             "containing the Average sheet and one sheet per iteration.")
     parser.add_argument("--output-csv", type=str, default="",
-                        help="Deprecated alias for --output-report. If used, a warning is printed "
-                             "and the output is still written as an .xlsx workbook.")
-    parser.add_argument("--iterations", type=int, default=3,
-                        help="Number of full benchmark iterations to run (default: 3)")
+                        help="CSV output path for benchmark results.")
     parser.add_argument("--init_type", type=str, default="randn",
                         choices=["hpl","trig_float","zeros","randn","increasing"],
                         help="Initialization type: randn (random normal), hpl (uniform -0.5 to 0.5), "
                              "trig_float (sin of indices), zeros, increasing (i+j normalized)")
     parser.add_argument("--shuffle-bench", action="store_true")
-    parser.add_argument("--csv-write-freq", type=int, default=1000)
     parser.add_argument("--print-verbose", action="store_true")
-    parser.add_argument("--enable-triton-sk", action="store_true")
-    parser.add_argument("--enable-streamk", action="store_true")
-    parser.add_argument("--torch-compile", action="store_true")
+    parser.add_argument("--tritonblas-modes", nargs="+",
+                        choices=["persistent", "streamk", "work_stealing", "streamk_work_stealing", "all"],
+                        help="TritonBLAS modes to benchmark. Use 'all' to run persistent, streamk, "
+                             "work_stealing, and streamk_work_stealing.")
+    parser.add_argument("--torch-compile-modes", nargs="+",
+                        choices=["default", "all"],
+                        help="torch.compile modes to benchmark. Use 'all' to run every configured "
+                             "torch.compile mode. New env-flag modes should be added here.")
     parser.add_argument("--dynamic", action="store_true")
-    parser.add_argument("--enable-mm-env", action="store_true",
-                        help="Benchmark torch.mm with TENSILE_SOLUTION_SELECTION_METHOD=2")
     parser.add_argument("--check-accuracy", action="store_true",
                         help="Check numerical accuracy against torch.matmul reference")
     parser.add_argument("--accuracy-tolerance", type=float, default=1e-2,
                         help="Tolerance for accuracy checks (default: 1e-2)")
+    parser.add_argument("--debug-csv-errors", action="store_true",
+                        help="Include max_abs_error and max_rel_error columns in the merged CSV.")
     parser.add_argument("--disable-torch-matmul", action="store_true",
                         help="Disable torch.matmul baseline benchmark")
     args = parser.parse_args()
 
-    output_report = args.output_report
-    if args.output_csv:
-        print("WARNING: --output-csv is deprecated; use --output-report. The report is now written as an .xlsx workbook.")
-        if not output_report:
-            output_report = args.output_csv
-
-    all_iteration_results = []
+    benchmark_results = []
     pending_exception = None
+    torch_compile_modes = resolve_torch_compile_modes(args)
+    tritonblas_modes = resolve_tritonblas_modes(args)
 
     try:
-        for iteration in range(1, args.iterations + 1):
+        if not args.disable_torch_matmul:
             if args.print_verbose:
-                print(f"\n=== Iteration {iteration}/{args.iterations} ===")
+                print("\n--- Baseline: torch.matmul ---")
+            baseline_results = bench_matmul(
+                args.input_yaml,
+                args.init_type,
+                shuffle_benchmark=args.shuffle_bench,
+                print_verbose=args.print_verbose,
+                enable_streamk=False,
+                torch_compile=False,
+                torch_compile_mode=None,
+                dynamic=False,
+                work_stealing=False,
+                tritonblas_mode=None,
+                enable_accuracy_check=args.check_accuracy,
+                accuracy_tolerance=args.accuracy_tolerance,
+                enable_torch_matmul=not args.disable_torch_matmul,
+                print_case_results=False,
+                progress_label="torch.matmul",
+            )
+            benchmark_results.extend(baseline_results)
+
+        for mode in torch_compile_modes:
+            if args.print_verbose:
+                print(f"\n--- torch.compile mode: {mode} ---")
+            clear_torch_compile_cache(print_verbose=args.print_verbose)
+            env_overrides = TORCH_COMPILE_MODE_CONFIGS[mode].get("env", {})
+            previous_env = apply_env_overrides(env_overrides)
+            try:
+                compile_results = bench_matmul(
+                    args.input_yaml,
+                    args.init_type,
+                    shuffle_benchmark=args.shuffle_bench,
+                    print_verbose=args.print_verbose,
+                    enable_streamk=False,
+                    torch_compile=True,
+                    torch_compile_mode=mode,
+                    dynamic=args.dynamic,
+                    work_stealing=False,
+                    tritonblas_mode=None,
+                    enable_accuracy_check=args.check_accuracy,
+                    accuracy_tolerance=args.accuracy_tolerance,
+                    enable_torch_matmul=False,
+                    print_case_results=False,
+                    progress_label=f"torch.compile[{mode}]",
+                )
+            finally:
+                restore_env_overrides(previous_env)
+            benchmark_results.extend(compile_results)
+
+        for mode in tritonblas_modes:
+            enable_streamk, work_stealing = TRITONBLAS_MODE_CONFIGS[mode]
+            if args.print_verbose:
+                print(f"\n--- TritonBLAS mode: {mode} ---")
+
             results = bench_matmul(
                 args.input_yaml,
                 args.init_type,
                 shuffle_benchmark=args.shuffle_bench,
-                output_csv=None,
-                write_csv_freq=args.csv_write_freq,
                 print_verbose=args.print_verbose,
-                enable_streamk=args.enable_streamk,
-                torch_compile=args.torch_compile,
-                enable_triton_sk=args.enable_triton_sk,
-                dynamic=args.dynamic,
-                enable_mm_env=args.enable_mm_env,
+                enable_streamk=enable_streamk,
+                torch_compile=False,
+                torch_compile_mode=None,
+                dynamic=False,
+                work_stealing=work_stealing,
+                tritonblas_mode=mode,
                 enable_accuracy_check=args.check_accuracy,
                 accuracy_tolerance=args.accuracy_tolerance,
-                enable_torch_matmul=not args.disable_torch_matmul,
+                enable_torch_matmul=False,
+                print_case_results=False,
+                progress_label=f"TritonBLAS[{mode}]",
             )
-            all_iteration_results.append(results)
+            benchmark_results.extend(results)
+
+        fill_speedups_vs_torch(benchmark_results)
+        if args.print_verbose:
+            print("\n--- Benchmark Summary ---")
+            print_benchmark_summary(benchmark_results)
     except BenchmarkRunError as exc:
         if exc.partial_results:
-            all_iteration_results.append(exc.partial_results)
+            benchmark_results.extend(exc.partial_results)
+            fill_speedups_vs_torch(benchmark_results)
         pending_exception = exc.original_exception
     except Exception as exc:
         pending_exception = exc
     finally:
-        if all_iteration_results or output_report:
-            write_reports(output_report, all_iteration_results)
+        if benchmark_results or args.output_csv:
+            gc.collect()
+            try:
+                write_csv(args.output_csv, benchmark_results, include_error_details=args.debug_csv_errors)
+            except OSError as exc:
+                if pending_exception is None:
+                    pending_exception = exc
+                else:
+                    print(f"WARNING: failed to write partial CSV results: {exc}")
 
     if pending_exception is not None:
         raise pending_exception
