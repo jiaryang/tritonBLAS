@@ -38,6 +38,7 @@ Usage Examples:
 import argparse
 import csv
 import gc
+import math
 import os
 import random
 import shutil
@@ -329,9 +330,8 @@ def fill_speedups_vs_torch(results):
 
 def format_vs_torch(speedup):
     if speedup is None:
-        return "N/A vs torch"
-    percent = (speedup - 1.0) * 100.0
-    return f"{speedup:.2f}x, {percent:+.1f}% vs torch"
+        return "N/A"
+    return f"{speedup:.2f}x"
 
 
 def format_accuracy(status):
@@ -343,7 +343,74 @@ def format_accuracy(status):
 def format_selected_streamk(status):
     if status is None:
         return ""
-    return f", streamk={'yes' if status else 'no'}"
+    return f", select_streamk={'yes' if status else 'no'}"
+
+
+def infer_torch_compile_selected_streamk(mode, best_kernel):
+    if best_kernel:
+        return "streamk" in best_kernel
+    if mode in {"force_streamk", "force_streamk_tuning"}:
+        return True
+    return None
+
+
+def speedup_stats(values):
+    values = [value for value in values if value and value > 0]
+    if not values:
+        return None
+    geomean = math.exp(sum(math.log(value) for value in values) / len(values))
+    mean = sum(values) / len(values)
+    variance = sum((value - mean) ** 2 for value in values) / len(values)
+    return {
+        "count": len(values),
+        "geomean": geomean,
+        "min": min(values),
+        "max": max(values),
+        "stdev": math.sqrt(variance),
+    }
+
+
+def print_speedup_stats(results):
+    stats_by_mode = OrderedDict()
+    for row in results:
+        if row.get("torch_compile_tflops"):
+            mode = row.get("torch_compile_mode") or "default"
+            mode_stats = stats_by_mode.setdefault(
+                f"torch.compile[{mode}]", {"speedups": [], "select_streamk": 0}
+            )
+            mode_stats["speedups"].append(row.get("speedup_compile_vs_torch"))
+            if row.get("torch_compile_selected_streamk"):
+                mode_stats["select_streamk"] += 1
+        if row.get("tritonblas_tflops"):
+            mode = row.get("tritonblas_mode") or "tritonblas"
+            stats_by_mode.setdefault(
+                f"TritonBLAS[{mode}]", {"speedups": [], "select_streamk": None}
+            )["speedups"].append(row.get("speedup_triton_vs_torch"))
+
+    stats_rows = [
+        (label, stats, mode_stats["select_streamk"])
+        for label, mode_stats in stats_by_mode.items()
+        if (stats := speedup_stats(mode_stats["speedups"])) is not None
+    ]
+    if not stats_rows:
+        return
+
+    label_width = max(len(label) for label, _, _ in stats_rows)
+    print("\n--- Speedup vs torch statistics ---")
+    print(
+        f"  {'mode':<{label_width}} : "
+        f"{'geomean':>8} {'min':>8} {'max':>8} {'stdev':>8} {'select_streamk':>14}"
+    )
+    for label, stats, select_streamk in stats_rows:
+        select_streamk_text = "-" if select_streamk is None else str(select_streamk)
+        print(
+            f"  {label:<{label_width}} : "
+            f"{stats['geomean']:>7.2f}x "
+            f"{stats['min']:>7.2f}x "
+            f"{stats['max']:>7.2f}x "
+            f"{stats['stdev']:>7.2f}x "
+            f"{select_streamk_text:>14}"
+        )
 
 
 def print_benchmark_summary(results):
@@ -354,19 +421,32 @@ def print_benchmark_summary(results):
     for case_idx, ((m, n, k, transA, transB, in_dtype, _), rows) in enumerate(grouped_rows.items(), start=1):
         print(f"\nTest {case_idx}: [M={m},N={n},K={k},trans={transA}{transB}] dtype={in_dtype}")
 
+        labels = []
+        for row in rows:
+            if row.get("torch_tflops"):
+                labels.append("torch.matmul")
+            if row.get("torch_compile_tflops"):
+                labels.append(f"torch.compile[{row.get('torch_compile_mode') or 'default'}]")
+            if row.get("tritonblas_tflops"):
+                labels.append(f"TritonBLAS[{row.get('tritonblas_mode') or 'tritonblas'}]")
+        label_width = max((len(label) for label in labels), default=0)
+
         for row in rows:
             if row.get("torch_tflops"):
                 print(
-                    f"  torch.matmul: {row['torch_tflops']:.3f} TF/s "
-                    f"({row['ms_torch']:.2f} ms, 100.0%)"
+                    f"  {'torch.matmul':<{label_width}} : "
+                    f"{row['torch_tflops']:>8.3f} TF/s "
+                    f"({row['ms_torch']:>6.2f} ms, 1.00x)"
                 )
 
         for row in rows:
             if row.get("torch_compile_tflops"):
                 mode = row.get("torch_compile_mode") or "default"
+                label = f"torch.compile[{mode}]"
                 print(
-                    f"  torch.compile[{mode}]: {row['torch_compile_tflops']:.3f} TF/s "
-                    f"({row['ms_compile']:.2f} ms, "
+                    f"  {label:<{label_width}} : "
+                    f"{row['torch_compile_tflops']:>8.3f} TF/s "
+                    f"({row['ms_compile']:>6.2f} ms, "
                     f"{format_vs_torch(row.get('speedup_compile_vs_torch'))}"
                     f"{format_selected_streamk(row.get('torch_compile_selected_streamk'))}"
                     f"{format_accuracy(row.get('accuracy_compile'))})"
@@ -375,12 +455,16 @@ def print_benchmark_summary(results):
         for row in rows:
             if row.get("tritonblas_tflops"):
                 mode = row.get("tritonblas_mode") or "tritonblas"
+                label = f"TritonBLAS[{mode}]"
                 print(
-                    f"  TritonBLAS[{mode}]: {row['tritonblas_tflops']:.3f} TF/s "
-                    f"({row['ms_triton']:.2f} ms, "
+                    f"  {label:<{label_width}} : "
+                    f"{row['tritonblas_tflops']:>8.3f} TF/s "
+                    f"({row['ms_triton']:>6.2f} ms, "
                     f"{format_vs_torch(row.get('speedup_triton_vs_torch'))}"
                     f"{format_accuracy(row.get('accuracy_triton'))})"
                 )
+
+    print_speedup_stats(results)
 
 
 def resolve_csv_path(output_csv):
@@ -560,15 +644,19 @@ def bench_matmul(
             tqdm(dataset_tuples) if not print_verbose else dataset_tuples
         ):
             # === prepare shapes ===
-            if transA == "T": A_size = (m, k)
-            else: A_size = (k, m)
-            if transB == "T": B_size = (k, n)
-            else: B_size = (n, k)
+            # GEMM convention: C = op(A) @ op(B), where N means no transpose
+            # and T means transpose.  The final tensors passed to matmul are
+            # always A=(m, k) and B=(k, n); transposed cases are non-contiguous
+            # views with BLAS-style flag semantics.
+            if transA == "N":
+                A = init_by_size_and_type((m, k), in_dtype, init_type)
+            else:
+                A = init_by_size_and_type((k, m), in_dtype, init_type).T
 
-            A = init_by_size_and_type(A_size, in_dtype, init_type)
-            B = init_by_size_and_type(B_size, in_dtype, init_type)
-            if transA == "N": A = A.T
-            if transB == "N": B = B.T
+            if transB == "N":
+                B = init_by_size_and_type((k, n), in_dtype, init_type)
+            else:
+                B = init_by_size_and_type((n, k), in_dtype, init_type).T
             C = torch.zeros((m, n), device="cuda", dtype=out_dtype)
 
             # FLOPs & TFLOPs conversion
@@ -597,8 +685,9 @@ def bench_matmul(
                 ms_compile = triton.testing.do_bench(lambda: compiled_fn(A, B), warmup=20, rep=100)
                 perf_compile = tflops(ms_compile)
                 torch_compile_best_kernel = os.environ.get("TORCHINDUCTOR_LAST_AUTOTUNE_BEST_KERNEL")
-                if torch_compile_best_kernel:
-                    torch_compile_selected_streamk = "streamk" in torch_compile_best_kernel
+                torch_compile_selected_streamk = infer_torch_compile_selected_streamk(
+                    torch_compile_mode, torch_compile_best_kernel
+                )
 
             # ------------------------------------------------------------
             # 3️⃣ TritonBLAS
